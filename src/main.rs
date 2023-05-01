@@ -1,18 +1,25 @@
 use actix_web::{get, put, web, App, HttpResponse, HttpServer, Responder};
+use clap::Parser;
+use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
-use std::sync::RwLock;
+use std::net::SocketAddr;
+use std::sync::{Mutex, RwLock};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    port: u16,
+    #[arg(short, long, default_value = "")]
+    follow: String,
+}
 
 struct KVStore {
     inner: RwLock<HashMap<String, String>>,
 }
 
 impl KVStore {
-    fn list(&self) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
-        inner.keys().cloned().collect::<Vec<String>>()
-    }
-
     fn get(&self, key: String) -> Option<String> {
         let inner = self.inner.read().unwrap();
         let val = inner.get(&key)?.clone();
@@ -25,7 +32,7 @@ impl KVStore {
     }
 }
 
-#[get("/{key}")]
+#[get("/kv/{key}")]
 async fn get(path: web::Path<String>, kv: web::Data<KVStore>) -> impl Responder {
     let key = path.into_inner();
     println!("GET {}", key);
@@ -35,44 +42,120 @@ async fn get(path: web::Path<String>, kv: web::Data<KVStore>) -> impl Responder 
     }
 }
 
-#[put("/{key}")]
-async fn put(path: web::Path<String>, kv: web::Data<KVStore>, bytes: web::Bytes) -> impl Responder {
+#[put("/kv/{key}")]
+async fn put(
+    path: web::Path<String>,
+    kv: web::Data<KVStore>,
+    replicas: web::Data<Replicas>,
+    bytes: web::Bytes,
+) -> impl Responder {
     let key = path.into_inner();
     let value = match String::from_utf8(bytes.to_vec()) {
         Ok(value) => value,
-        Err(_) => return HttpResponse::BadRequest(),
+        Err(_) => return HttpResponse::BadRequest().body("Invalid UTF-8"),
     };
+
     println!("PUT {} {}", key, value);
+    if let Err(e) = replicas.put(key.clone(), value.clone()).await {
+        return HttpResponse::InternalServerError().body(e.to_string());
+    }
     kv.put(key, value);
-    HttpResponse::Ok()
+    HttpResponse::Ok().body("OK")
 }
 
-#[get("/")]
-async fn index(kv: web::Data<KVStore>) -> impl Responder {
-    kv.list().join("\n")
+struct Replicas {
+    inner: Mutex<Vec<SocketAddr>>,
+}
+
+impl Replicas {
+    fn add(&self, addr: SocketAddr) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.push(addr);
+    }
+
+    async fn put(&self, key: String, value: String) -> Result<(), std::io::Error> {
+        let inner = self.inner.lock().unwrap();
+        let requests = inner.iter().map(|addr| {
+            reqwest::Client::new()
+                .put(format!("http://{}/kv/{}", addr, key))
+                .body(value.clone())
+                .send()
+        });
+
+        for resp in join_all(requests).await {
+            match resp {
+                Ok(_resp) => (),
+                Err(e) => {
+                    return std::io::Result::Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to replicate to replica: {}", e),
+                    ))
+                }
+            }
+        }
+        return Ok(());
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Replica {
+    addr: String,
+}
+
+#[put("/replica")]
+async fn replica(replicas: web::Data<Replicas>, replica: web::Json<Replica>) -> impl Responder {
+    let addr = replica.addr.parse::<SocketAddr>();
+    match addr {
+        Ok(addr) => {
+            replicas.add(addr);
+            println!("Replica added: {}", addr);
+            HttpResponse::Ok().body("OK")
+        }
+        Err(e) => HttpResponse::BadRequest().body(e.to_string()),
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
 
-    let port = if args.len() > 1 {
-        args[1].parse::<u16>().unwrap()
-    } else {
-        8080
-    };
     let kv_store = web::Data::new(KVStore {
         inner: RwLock::new(HashMap::new()),
+    });
+    let replicas = web::Data::new(Replicas {
+        inner: Mutex::new(Vec::new()),
     });
 
     let http_server = HttpServer::new(move || {
         App::new()
             .app_data(kv_store.clone())
-            .service(index)
+            .app_data(replicas.clone())
             .service(get)
             .service(put)
+            .service(replica)
     });
 
-    println!("Listening on port {}", port);
-    http_server.bind(("127.0.0.1", port)).unwrap().run().await
+    println!("Listening on port {}", args.port);
+    let server = http_server.bind(("127.0.0.1", args.port)).unwrap().run();
+
+    if args.follow != "" {
+        let resp = reqwest::Client::new()
+            .put(format!("{}/replica", args.follow))
+            .json(&Replica {
+                addr: format!("127.0.0.1:{}", args.port),
+            })
+            .send()
+            .await;
+        match resp {
+            Ok(resp) => println!("Registered with primary: {}", resp.status()),
+            Err(e) => {
+                return std::io::Result::Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to register with primary: {}", e),
+                ))
+            }
+        }
+    }
+
+    server.await
 }
