@@ -1,4 +1,4 @@
-use crate::Replicas;
+use crate::*;
 use actix_web::{get, put, web, HttpResponse, Responder};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -40,7 +40,8 @@ async fn get(path: web::Path<String>, kv: web::Data<Store>) -> impl Responder {
 async fn put(
     path: web::Path<String>,
     kv: web::Data<Store>,
-    replicas: web::Data<Replicas>,
+    async_replicas: web::Data<AsyncReplicas>,
+    sync_replicas: web::Data<SyncReplicas>,
     bytes: web::Bytes,
 ) -> impl Responder {
     let key = path.into_inner();
@@ -50,9 +51,10 @@ async fn put(
     };
 
     println!("PUT {} {}", key, value);
-    if let Err(e) = replicas.put(key.clone(), value.clone()).await {
+    if let Err(e) = sync_replicas.put(key.clone(), value.clone()).await {
         return HttpResponse::InternalServerError().body(e.to_string());
     }
+    async_replicas.put(key.clone(), value.clone());
     kv.put(key, value);
     HttpResponse::Ok().body("OK")
 }

@@ -2,27 +2,75 @@ use actix_web::{put, web, HttpResponse, Responder};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
-pub struct Replicas {
-    inner: Mutex<Vec<SocketAddr>>,
+pub struct AsyncReplicas {
+    tx: watch::Sender<(String, String)>,
+    replicas: Arc<Mutex<Vec<SocketAddr>>>,
 }
 
-impl Replicas {
-    pub fn new() -> Replicas {
-        Replicas {
-            inner: Mutex::new(Vec::new()),
+impl AsyncReplicas {
+    pub async fn new() -> AsyncReplicas {
+        let (tx, mut rx) = watch::channel(("".to_string(), "".to_string()));
+        let replicas = Arc::new(Mutex::new(Vec::new()));
+        {
+            let replicas = replicas.clone();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let (key, value) = rx.borrow().clone();
+                    let replicas = replicas.lock().unwrap().clone();
+                    for addr in replicas.iter() {
+                        let resp = reqwest::Client::new()
+                            .put(format!("http://{}/kv/{}", addr, key))
+                            .body(value.clone())
+                            .send()
+                            .await;
+
+                        match resp {
+                            Ok(_resp) => (),
+                            Err(e) => println!("Failed to replicate to replica: {}", e),
+                        }
+                    }
+                }
+            });
+        }
+
+        AsyncReplicas {
+            tx,
+            replicas: replicas.clone(),
         }
     }
 
     fn add(&self, addr: SocketAddr) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.push(addr);
+        let mut replicas = self.replicas.lock().unwrap();
+        replicas.push(addr);
+    }
+
+    pub fn put(&self, key: String, value: String) {
+        self.tx.send((key, value)).unwrap();
+    }
+}
+
+pub struct SyncReplicas {
+    replicas: Mutex<Vec<SocketAddr>>,
+}
+
+impl SyncReplicas {
+    pub fn new() -> SyncReplicas {
+        SyncReplicas {
+            replicas: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn add(&self, addr: SocketAddr) {
+        let mut replicas = self.replicas.lock().unwrap();
+        replicas.push(addr);
     }
 
     pub async fn put(&self, key: String, value: String) -> Result<(), std::io::Error> {
-        let inner = self.inner.lock().unwrap();
-        let requests = inner.iter().map(|addr| {
+        let replicas = self.replicas.lock().unwrap();
+        let requests = replicas.iter().map(|addr| {
             reqwest::Client::new()
                 .put(format!("http://{}/kv/{}", addr, key))
                 .body(value.clone())
@@ -40,30 +88,41 @@ impl Replicas {
                 }
             }
         }
-        return Ok(());
+        Ok(())
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Replica {
     addr: String,
+    asynchronous: bool,
 }
 
 impl Replica {
-    pub fn new(port: u16) -> Replica {
+    pub fn new(port: u16, asynchronous: bool) -> Replica {
         Replica {
             addr: format!("127.0.0.1:{}", port),
+            asynchronous,
         }
     }
 }
 
 #[put("/replica")]
-async fn replica(replicas: web::Data<Replicas>, replica: web::Json<Replica>) -> impl Responder {
+async fn replica(
+    async_replicas: web::Data<AsyncReplicas>,
+    sync_replicas: web::Data<SyncReplicas>,
+    replica: web::Json<Replica>,
+) -> impl Responder {
     let addr = replica.addr.parse::<SocketAddr>();
     match addr {
         Ok(addr) => {
-            replicas.add(addr);
-            println!("Replica added: {}", addr);
+            if replica.asynchronous {
+                async_replicas.add(addr);
+                println!("Aynchronous replica added: {}", addr);
+            } else {
+                sync_replicas.add(addr);
+                println!("Synchronous replica added: {}", addr);
+            }
             HttpResponse::Ok().body("OK")
         }
         Err(e) => HttpResponse::BadRequest().body(e.to_string()),
