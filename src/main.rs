@@ -3,10 +3,14 @@ use actix_web::{web, App, HttpServer};
 use clap::Parser;
 
 mod replication;
+mod routes;
 mod store;
+mod wal;
 
 use replication::*;
+use routes::*;
 use store::*;
+use wal::*;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,6 +30,7 @@ async fn main() -> std::io::Result<()> {
     let async_replicas = web::Data::new(AsyncReplicas::new().await);
     let http_server = HttpServer::new(move || {
         App::new()
+            .app_data(web::Data::new(Log::new()))
             .app_data(web::Data::new(Store::new()))
             .app_data(async_replicas.clone())
             .app_data(web::Data::new(SyncReplicas::new()))

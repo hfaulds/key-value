@@ -1,4 +1,3 @@
-use actix_web::{put, web, HttpResponse, Responder};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -42,7 +41,7 @@ impl AsyncReplicas {
         }
     }
 
-    fn add(&self, addr: SocketAddr) {
+    pub fn add(&self, addr: SocketAddr) {
         let mut replicas = self.replicas.lock().unwrap();
         replicas.push(addr);
     }
@@ -63,7 +62,7 @@ impl SyncReplicas {
         }
     }
 
-    fn add(&self, addr: SocketAddr) {
+    pub fn add(&self, addr: SocketAddr) {
         let mut replicas = self.replicas.lock().unwrap();
         replicas.push(addr);
     }
@@ -94,8 +93,8 @@ impl SyncReplicas {
 
 #[derive(Serialize, Deserialize)]
 pub struct Replica {
-    addr: String,
-    asynchronous: bool,
+    pub addr: String,
+    pub asynchronous: bool,
 }
 
 impl Replica {
@@ -104,27 +103,5 @@ impl Replica {
             addr: format!("127.0.0.1:{}", port),
             asynchronous,
         }
-    }
-}
-
-#[put("/replica")]
-async fn replica(
-    async_replicas: web::Data<AsyncReplicas>,
-    sync_replicas: web::Data<SyncReplicas>,
-    replica: web::Json<Replica>,
-) -> impl Responder {
-    let addr = replica.addr.parse::<SocketAddr>();
-    match addr {
-        Ok(addr) => {
-            if replica.asynchronous {
-                async_replicas.add(addr);
-                println!("Aynchronous replica added: {}", addr);
-            } else {
-                sync_replicas.add(addr);
-                println!("Synchronous replica added: {}", addr);
-            }
-            HttpResponse::Ok().body("OK")
-        }
-        Err(e) => HttpResponse::BadRequest().body(e.to_string()),
     }
 }
