@@ -15,8 +15,8 @@ async fn get(path: web::Path<String>, kv: web::Data<Store>) -> impl Responder {
 #[put("/kv/{key}")]
 async fn put(
     path: web::Path<String>,
-    log: web::Data<Log>,
     kv: web::Data<Store>,
+    wal: web::Data<Log>,
     async_replicas: web::Data<AsyncReplicas>,
     sync_replicas: web::Data<SyncReplicas>,
     bytes: web::Bytes,
@@ -28,12 +28,16 @@ async fn put(
     };
 
     println!("PUT {} {}", key, value);
-    log.put(key.clone(), value.clone());
 
-    if let Err(e) = sync_replicas.put(key.clone(), value.clone()).await {
+    println!("Writing to WAL");
+    let op = wal.put(key.clone(), value.clone());
+    println!("Writing to {} sync replicas", sync_replicas.len());
+    if let Err(e) = sync_replicas.replicate(op).await {
         return HttpResponse::InternalServerError().body(e.to_string());
     }
+    println!("Writing to {} async replicas", async_replicas.len());
     async_replicas.put(key.clone(), value.clone());
+
     kv.put(key, value);
     HttpResponse::Ok().body("OK")
 }

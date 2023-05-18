@@ -28,12 +28,15 @@ async fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
     let async_replicas = web::Data::new(AsyncReplicas::new().await);
+    let sync_replicas = web::Data::new(SyncReplicas::new());
+    let log = web::Data::new(Log::new());
+    let store = web::Data::new(Store::new());
     let http_server = HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(Log::new()))
-            .app_data(web::Data::new(Store::new()))
+            .app_data(log.clone())
+            .app_data(store.clone())
             .app_data(async_replicas.clone())
-            .app_data(web::Data::new(SyncReplicas::new()))
+            .app_data(sync_replicas.clone())
             .service(get)
             .service(put)
             .service(replica)
